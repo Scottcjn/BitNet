@@ -21,6 +21,51 @@ static inline int hsum_i32_4_vsx(vector signed int v) {
     sum = vec_add(sum, vec_sld(sum, sum, 4));
     return vec_extract(sum, 0);
 }
+
+// POWER8 VSX/AltiVec I2_S kernel helpers
+#include <altivec.h>
+
+// Prefetch weight data to L1 cache
+#define I2S_DCBT(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr) : "memory")
+// Prefetch to L2 with stream hint
+#define I2S_DCBT_L2(addr) __asm__ __volatile__("dcbt 0,%0,8" : : "r"(addr) : "memory")
+
+static const vector unsigned char vsx_mask03 = {3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3};
+static const vector unsigned char vsx_shift2 = {2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2};
+static const vector unsigned char vsx_shift4 = {4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4};
+static const vector unsigned char vsx_shift6 = {6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6};
+
+// Process one 16-byte half of an I2_S block using vec_msum
+// Unpacks 2-bit weights and multiplies by signed activations
+static inline vector signed int i2s_vsx_half(
+    const uint8_t * __restrict__ px, int px_off,
+    const int8_t  * __restrict__ py, int py_off,
+    vector signed int accu)
+{
+    vector unsigned char packed = vec_vsx_ld(px_off, (const unsigned char *)px);
+
+    // Unpack 4 groups from 2-bit packed weights
+    vector unsigned char w0 = vec_and(vec_sr(packed, vsx_shift6), vsx_mask03);
+    vector unsigned char w1 = vec_and(vec_sr(packed, vsx_shift4), vsx_mask03);
+    vector unsigned char w2 = vec_and(vec_sr(packed, vsx_shift2), vsx_mask03);
+    vector unsigned char w3 = vec_and(packed, vsx_mask03);
+
+    // Load 16 bytes of activations from each of the 4 groups
+    vector signed char y0 = vec_vsx_ld(py_off,      (const signed char *)py);
+    vector signed char y1 = vec_vsx_ld(py_off + 32,  (const signed char *)py);
+    vector signed char y2 = vec_vsx_ld(py_off + 64,  (const signed char *)py);
+    vector signed char y3 = vec_vsx_ld(py_off + 96,  (const signed char *)py);
+
+    // vec_msum: signed char * unsigned char -> accumulate to int32
+    // vmsummbm instruction: 16 multiplies + 4 adds per call
+    accu = vec_msum(y0, w0, accu);
+    accu = vec_msum(y1, w1, accu);
+    accu = vec_msum(y2, w2, accu);
+    accu = vec_msum(y3, w3, accu);
+
+    return accu;
+}
+
 #else
 // Scalar fallback
 #define QK_I2_S 128
@@ -203,6 +248,46 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
     free(q8);
 
     // 32B for alignment
+    return nrow * row_size / 4 + 32;
+
+
+#elif defined(__VSX__) || defined(__ALTIVEC__)
+    // POWER8 VSX quantization (same packing format as x86 ACT_PARALLEL)
+    size_t row_size = ggml_row_size(GGML_TYPE_I2_S, n_per_row);
+
+    int64_t n_total = (int64_t)nrow * n_per_row;
+
+    double max_val = 0;
+    for (int64_t i = 0; i < n_total; ++i) {
+        max_val = fmax(max_val, (double)fabs((double)src[i]));
+    }
+    double i2_scale = max_val;
+
+    uint8_t* q8 = (uint8_t*)malloc(n_total * sizeof(uint8_t));
+    for (int64_t i = 0; i < n_total; i++) {
+        if (fabs((double)(src[i])) < 1e-6) {
+            q8[i] = 1;
+            continue;
+        }
+        q8[i] = (double)src[i] * i2_scale > 0 ? 2 : 0;
+    }
+
+    memset(dst, 0, n_total * sizeof(uint8_t) / 4);
+
+    uint8_t* i2_weight = (uint8_t*)dst;
+    for (int64_t i = 0; i < n_total / QK_I2_S; i++) {
+        for (int j = 0; j < QK_I2_S; j++) {
+            int group_idx = j / 32;
+            int group_pos = j % 32;
+            uint8_t temp = (q8[i * QK_I2_S + j] << (6 - 2 * group_idx));
+            i2_weight[i * 32 + group_pos] |= temp;
+        }
+    }
+
+    float* scale_ptr = (float*)((char*)i2_weight + n_total / 4);
+    scale_ptr[0] = (float)i2_scale;
+
+    free(q8);
     return nrow * row_size / 4 + 32;
 
 #else
@@ -465,6 +550,34 @@ void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size
         s[row] = (float)sumi;
     }
 
+#elif defined(__VSX__) || defined(__ALTIVEC__)
+    // POWER8 VSX optimized - 1x1 kernel
+    const uint8_t * x = (uint8_t *)vx;
+    const int8_t  * y = (int8_t *)vy;
+    const int nb = n / QK_I2_S;
+
+    for (int row = 0; row < nrc; row++) {
+        vector signed int accu = vec_splats((int)0);
+        const uint8_t * x_row = x + row * bx / 4;
+
+        for (int block = 0; block < nb; block++) {
+            const uint8_t * px = x_row + block * 32;
+            const int8_t  * py = y + block * 128;
+
+            // Prefetch next block
+            if (block + 1 < nb) {
+                I2S_DCBT(px + 32);
+                I2S_DCBT(py + 128);
+            }
+
+            // Process 32 bytes of weights in 2 x 16-byte halves
+            accu = i2s_vsx_half(px, 0,  py, 0,  accu);
+            accu = i2s_vsx_half(px, 16, py, 16, accu);
+        }
+
+        s[row] = (float)hsum_i32_4_vsx(accu);
+    }
+
 #else
     // Scalar fallback (PowerPC / generic)
     const uint8_t * x = (uint8_t *)vx;
@@ -595,6 +708,50 @@ void ggml_vec_dot_i2_i8_s_1x4_32W(int n, float * s, size_t bs, const void * vx, 
     }
 #elif defined(__ARM_NEON)
 
+
+#elif defined(__VSX__) || defined(__ALTIVEC__)
+    // POWER8 VSX optimized - 1x4_32W kernel (4 rows, 32-wide interleaved)
+    const uint8_t * x = (uint8_t *)vx;
+    const int8_t  * y = (int8_t *)vy;
+    const int nb = n / QK_I2_S;
+
+    for (int row = 0; row < nrc; row += 4) {
+        vector signed int accu0 = vec_splats((int)0);
+        vector signed int accu1 = vec_splats((int)0);
+        vector signed int accu2 = vec_splats((int)0);
+        vector signed int accu3 = vec_splats((int)0);
+        const uint8_t * x_base = x + row * bx / 4;
+
+        for (int block = 0; block < nb; block++) {
+            for (int sub = 0; sub < 4; sub++) {
+                const uint8_t * px = x_base + (block * 4 + sub) * 32;
+                const int8_t  * py = y + block * 128 + sub * 32;
+
+                // Prefetch next iteration
+                I2S_DCBT(px + 32);
+
+                // Process 32 bytes in 2 halves of 16
+                for (int half = 0; half < 2; half++) {
+                    vector unsigned char packed = vec_vsx_ld(half * 16, (const unsigned char *)px);
+                    vector unsigned char w0 = vec_and(vec_sr(packed, vsx_shift6), vsx_mask03);
+                    vector unsigned char w1 = vec_and(vec_sr(packed, vsx_shift4), vsx_mask03);
+                    vector unsigned char w2 = vec_and(vec_sr(packed, vsx_shift2), vsx_mask03);
+                    vector unsigned char w3 = vec_and(packed, vsx_mask03);
+
+                    vector signed char yv = vec_vsx_ld(half * 16, (const signed char *)py);
+                    accu0 = vec_msum(yv, w0, accu0);
+                    accu1 = vec_msum(yv, w1, accu1);
+                    accu2 = vec_msum(yv, w2, accu2);
+                    accu3 = vec_msum(yv, w3, accu3);
+                }
+            }
+        }
+
+        s[row + 0] = (float)hsum_i32_4_vsx(accu0);
+        s[row + 1] = (float)hsum_i32_4_vsx(accu1);
+        s[row + 2] = (float)hsum_i32_4_vsx(accu2);
+        s[row + 3] = (float)hsum_i32_4_vsx(accu3);
+    }
 
 #else
     // Scalar fallback (PowerPC / generic)
@@ -912,6 +1069,44 @@ void ggml_vec_dot_i2_i8_s_1xN(int n, float * s, size_t bs, const void * vx, size
         }
     }
 
+#elif defined(__VSX__) || defined(__ALTIVEC__)
+    // POWER8 VSX optimized - 1xN kernel (PARALLEL_SIZE rows)
+    const uint8_t * x = (uint8_t *)vx;
+    const int8_t  * y = (int8_t *)vy;
+    const int nb = n / QK_I2_S;
+
+    for (int row = 0; row < nrc; row += PARALLEL_SIZE) {
+        vector signed int accu[PARALLEL_SIZE];
+        const uint8_t * x_rows[PARALLEL_SIZE];
+
+        for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+            accu[rb] = vec_splats((int)0);
+            x_rows[rb] = x + (row + rb) * bx / 4;
+        }
+
+        for (int block = 0; block < nb; block++) {
+            const int8_t * py = y + block * 128;
+
+            // Prefetch next block activations
+            if (block + 1 < nb) I2S_DCBT(py + 128);
+
+            for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+                const uint8_t * px = x_rows[rb] + block * 32;
+
+                // Prefetch next block weights for this row
+                if (block + 1 < nb) I2S_DCBT(px + 32);
+
+                // 2 halves of 16 bytes each
+                accu[rb] = i2s_vsx_half(px, 0,  py, 0,  accu[rb]);
+                accu[rb] = i2s_vsx_half(px, 16, py, 16, accu[rb]);
+            }
+        }
+
+        for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+            s[row + rb] = (float)hsum_i32_4_vsx(accu[rb]);
+        }
+    }
+
 #else
     // Scalar fallback (PowerPC / generic)
     // Processes PARALLEL_SIZE rows at a time
@@ -1203,6 +1398,53 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
         for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
             int sumi = vaddlvq_s32(accu[iy]);
             s[(col + iy) * bs] = (float)sumi;
+        }
+    }
+
+#elif defined(__VSX__) || defined(__ALTIVEC__)
+    // POWER8 VSX optimized - Nx1 kernel (single x row, PARALLEL_SIZE y columns)
+    const uint8_t * x = (uint8_t *)vx;
+    const int8_t  * y = (int8_t *)vy;
+    const int nb = n / QK_I2_S;
+
+    for (int col = 0; col < nrc; col += PARALLEL_SIZE) {
+        vector signed int accu[PARALLEL_SIZE];
+        for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+            accu[iy] = vec_splats((int)0);
+        }
+
+        for (int block = 0; block < nb; block++) {
+            const uint8_t * px = x + block * 32;
+
+            // Prefetch next block weights
+            if (block + 1 < nb) I2S_DCBT(px + 32);
+
+            // Process 2 halves of 16 bytes
+            for (int half = 0; half < 2; half++) {
+                vector unsigned char packed = vec_vsx_ld(half * 16, (const unsigned char *)px);
+                vector unsigned char w0 = vec_and(vec_sr(packed, vsx_shift6), vsx_mask03);
+                vector unsigned char w1 = vec_and(vec_sr(packed, vsx_shift4), vsx_mask03);
+                vector unsigned char w2 = vec_and(vec_sr(packed, vsx_shift2), vsx_mask03);
+                vector unsigned char w3 = vec_and(packed, vsx_mask03);
+
+                for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+                    const int8_t * py = (const int8_t *)vy + (col + iy) * by + block * 128;
+
+                    vector signed char y0 = vec_vsx_ld(half * 16,      (const signed char *)py);
+                    vector signed char y1 = vec_vsx_ld(half * 16 + 32, (const signed char *)py);
+                    vector signed char y2 = vec_vsx_ld(half * 16 + 64, (const signed char *)py);
+                    vector signed char y3 = vec_vsx_ld(half * 16 + 96, (const signed char *)py);
+
+                    accu[iy] = vec_msum(y0, w0, accu[iy]);
+                    accu[iy] = vec_msum(y1, w1, accu[iy]);
+                    accu[iy] = vec_msum(y2, w2, accu[iy]);
+                    accu[iy] = vec_msum(y3, w3, accu[iy]);
+                }
+            }
+        }
+
+        for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+            s[(col + iy) * bs] = (float)hsum_i32_4_vsx(accu[iy]);
         }
     }
 
