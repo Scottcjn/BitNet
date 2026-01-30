@@ -12,6 +12,18 @@
 #define QK_I2_S 128
 #elif defined(__ARM_NEON)
 #define QK_I2_S 64
+#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(__powerpc64__)
+#define QK_I2_S 128
+#include <altivec.h>
+// POWER8 VSX horizontal sum for 4x int32
+static inline int hsum_i32_4_vsx(vector signed int v) {
+    vector signed int sum = vec_add(v, vec_sld(v, v, 8));
+    sum = vec_add(sum, vec_sld(sum, sum, 4));
+    return vec_extract(sum, 0);
+}
+#else
+// Scalar fallback
+#define QK_I2_S 128
 #endif
 
 #if defined(__AVX__) || defined(__AVX2__) || defined(__AVX512F__) || defined(__SSSE3__)
@@ -192,6 +204,50 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
 
     // 32B for alignment
     return nrow * row_size / 4 + 32;
+
+#else
+    // Scalar fallback (PowerPC / generic)
+    // Uses same packing format as x86 ACT_PARALLEL: 128 elements -> 32 bytes
+    // Each byte: bits 7-6 = group0, 5-4 = group1, 3-2 = group2, 1-0 = group3
+    size_t row_size = ggml_row_size(GGML_TYPE_I2_S, n_per_row);
+
+    int64_t n_total = (int64_t)nrow * n_per_row;
+
+    // f32 -> q8 (ternary: 0=-1, 1=0, 2=+1)
+    double max_val = 0;
+    for (int64_t i = 0; i < n_total; ++i) {
+        max_val = fmax(max_val, (double)fabs((double)src[i]));
+    }
+    double i2_scale = max_val;
+
+    uint8_t* q8 = (uint8_t*)malloc(n_total * sizeof(uint8_t));
+    for (int64_t i = 0; i < n_total; i++) {
+        if (fabs((double)(src[i])) < 1e-6) {
+            q8[i] = 1;  // zero -> 1
+            continue;
+        }
+        q8[i] = (double)src[i] * i2_scale > 0 ? 2 : 0;  // +1 -> 2, -1 -> 0
+    }
+
+    memset(dst, 0, n_total * sizeof(uint8_t) / 4);
+
+    uint8_t* i2_weight = (uint8_t*)dst;
+    for (int64_t i = 0; i < n_total / QK_I2_S; i++) {
+        for (int j = 0; j < QK_I2_S; j++) {
+            int group_idx = j / 32;
+            int group_pos = j % 32;
+            uint8_t temp = (q8[i * QK_I2_S + j] << (6 - 2 * group_idx));
+            i2_weight[i * 32 + group_pos] |= temp;
+        }
+    }
+
+    float* scale_ptr = (float*)((char*)i2_weight + n_total / 4);
+    scale_ptr[0] = (float)i2_scale;
+
+    free(q8);
+
+    return nrow * row_size / 4 + 32;
+
 #endif
 }
 
@@ -408,6 +464,39 @@ void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size
         int sumi = vaddlvq_s32(accu);
         s[row] = (float)sumi;
     }
+
+#else
+    // Scalar fallback (PowerPC / generic)
+    const uint8_t * x = (uint8_t *)vx;
+    const int8_t  * y = (int8_t *)vy;
+
+    const int nb = n / QK_I2_S;
+
+    for (int row = 0; row < nrc; row++) {
+        int32_t sumi = 0;
+        const uint8_t * x_row = x + row * bx / 4;
+
+        for (int block = 0; block < nb; block++) {
+            const uint8_t * px = x_row + block * 32;   // 128 elements / 4 per byte = 32 bytes
+            const int8_t  * py = y + block * 128;       // 128 int8 activations
+
+            for (int pos = 0; pos < 32; pos++) {
+                uint8_t packed = px[pos];
+                uint8_t w0 = (packed >> 6) & 0x03;  // group 0
+                uint8_t w1 = (packed >> 4) & 0x03;  // group 1
+                uint8_t w2 = (packed >> 2) & 0x03;  // group 2
+                uint8_t w3 = (packed >> 0) & 0x03;  // group 3
+
+                sumi += (int32_t)w0 * (int32_t)py[pos];
+                sumi += (int32_t)w1 * (int32_t)py[32 + pos];
+                sumi += (int32_t)w2 * (int32_t)py[64 + pos];
+                sumi += (int32_t)w3 * (int32_t)py[96 + pos];
+            }
+        }
+
+        s[row] = (float)sumi;
+    }
+
 #endif
 }
 
@@ -505,6 +594,43 @@ void ggml_vec_dot_i2_i8_s_1x4_32W(int n, float * s, size_t bs, const void * vx, 
         }
     }
 #elif defined(__ARM_NEON)
+
+
+#else
+    // Scalar fallback (PowerPC / generic)
+    // Processes 4 rows at a time with 32-wide interleaved x layout
+    const uint8_t * x = (uint8_t *)vx;
+    const int8_t  * y = (int8_t *)vy;
+
+    const int nb = n / QK_I2_S;
+
+    for (int row = 0; row < nrc; row += 4) {
+        int32_t sumi[4] = {0, 0, 0, 0};
+        const uint8_t * x_base = x + row * bx / 4;
+
+        for (int block = 0; block < nb; block++) {
+            // In 32W layout, x has 4 sub-blocks of 32 bytes per block
+            // y is accessed linearly, 32 bytes at a time
+            for (int sub = 0; sub < 4; sub++) {
+                const uint8_t * px = x_base + (block * 4 + sub) * 32;
+                const int8_t  * py = y + block * 128 + sub * 32;
+
+                for (int pos = 0; pos < 32; pos++) {
+                    uint8_t packed = px[pos];
+                    int8_t yval = py[pos];
+
+                    sumi[0] += (int32_t)((packed >> 6) & 0x03) * (int32_t)yval;
+                    sumi[1] += (int32_t)((packed >> 4) & 0x03) * (int32_t)yval;
+                    sumi[2] += (int32_t)((packed >> 2) & 0x03) * (int32_t)yval;
+                    sumi[3] += (int32_t)((packed >> 0) & 0x03) * (int32_t)yval;
+                }
+            }
+        }
+
+        for (int rb = 0; rb < 4; rb++) {
+            s[row + rb] = (float)sumi[rb];
+        }
+    }
 
 #endif
 }
@@ -785,6 +911,49 @@ void ggml_vec_dot_i2_i8_s_1xN(int n, float * s, size_t bs, const void * vx, size
             s[row + rb] = (float)sumi;
         }
     }
+
+#else
+    // Scalar fallback (PowerPC / generic)
+    // Processes PARALLEL_SIZE rows at a time
+    const uint8_t * x = (uint8_t *)vx;
+    const int8_t  * y = (int8_t *)vy;
+
+    const int nb = n / QK_I2_S;
+
+    for (int row = 0; row < nrc; row += PARALLEL_SIZE) {
+        int32_t sumi[PARALLEL_SIZE];
+        const uint8_t * x_rows[PARALLEL_SIZE];
+
+        for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+            sumi[rb] = 0;
+            x_rows[rb] = x + (row + rb) * bx / 4;
+        }
+
+        for (int block = 0; block < nb; block++) {
+            const int8_t * py = y + block * 128;
+
+            for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+                const uint8_t * px = x_rows[rb] + block * 32;
+                for (int pos = 0; pos < 32; pos++) {
+                    uint8_t packed = px[pos];
+                    uint8_t w0 = (packed >> 6) & 0x03;
+                    uint8_t w1 = (packed >> 4) & 0x03;
+                    uint8_t w2 = (packed >> 2) & 0x03;
+                    uint8_t w3 = (packed >> 0) & 0x03;
+
+                    sumi[rb] += (int32_t)w0 * (int32_t)py[pos];
+                    sumi[rb] += (int32_t)w1 * (int32_t)py[32 + pos];
+                    sumi[rb] += (int32_t)w2 * (int32_t)py[64 + pos];
+                    sumi[rb] += (int32_t)w3 * (int32_t)py[96 + pos];
+                }
+            }
+        }
+
+        for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
+            s[row + rb] = (float)sumi[rb];
+        }
+    }
+
 #endif
 }
 
@@ -1036,6 +1205,47 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
             s[(col + iy) * bs] = (float)sumi;
         }
     }
+
+#else
+    // Scalar fallback (PowerPC / generic)
+    // Single x row, PARALLEL_SIZE y columns
+    const uint8_t * x = (uint8_t *)vx;
+    const int8_t  * y = (int8_t *)vy;
+
+    const int nb = n / QK_I2_S;
+
+    for (int col = 0; col < nrc; col += PARALLEL_SIZE) {
+        int32_t sumi[PARALLEL_SIZE];
+        for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+            sumi[iy] = 0;
+        }
+
+        for (int block = 0; block < nb; block++) {
+            const uint8_t * px = x + block * 32;
+
+            for (int pos = 0; pos < 32; pos++) {
+                uint8_t packed = px[pos];
+                uint8_t w0 = (packed >> 6) & 0x03;
+                uint8_t w1 = (packed >> 4) & 0x03;
+                uint8_t w2 = (packed >> 2) & 0x03;
+                uint8_t w3 = (packed >> 0) & 0x03;
+
+                for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+                    const int8_t * py = (const int8_t *)vy + (col + iy) * by + block * 128;
+
+                    sumi[iy] += (int32_t)w0 * (int32_t)py[pos];
+                    sumi[iy] += (int32_t)w1 * (int32_t)py[32 + pos];
+                    sumi[iy] += (int32_t)w2 * (int32_t)py[64 + pos];
+                    sumi[iy] += (int32_t)w3 * (int32_t)py[96 + pos];
+                }
+            }
+        }
+
+        for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
+            s[(col + iy) * bs] = (float)sumi[iy];
+        }
+    }
+
 #endif
 }
 

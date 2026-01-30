@@ -31,5 +31,16 @@
     #define PARALLEL_SIZE 4
 #endif // ACT_PARALLEL
 #endif // __ARM_FEATURE_DOTPROD
+#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(__powerpc64__)
+// PowerPC (POWER8+) with VSX/AltiVec
+#if defined(ACT_PARALLEL)
+    #define ROW_BLOCK_SIZE 4
+    #define COL_BLOCK_SIZE 128
+    #define PARALLEL_SIZE 4
+#else
+    #define ROW_BLOCK_SIZE 128
+    #define COL_BLOCK_SIZE 32
+    #define PARALLEL_SIZE 8
+#endif // ACT_PARALLEL
 #endif // __AVX__
 
