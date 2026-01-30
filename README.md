@@ -337,3 +337,75 @@ Import-Module "C:\Program Files\Microsoft Visual Studio\2022\Professional\Common
 ```
 
 These steps will initialize your environment and allow you to use the correct Visual Studio tools.
+
+---
+
+## POWER8 / PowerPC Support
+
+bitnet.cpp has been ported to IBM POWER8 (ppc64le) with AltiVec/VSX SIMD optimizations.
+This is the first port of BitNet to the PowerPC architecture.
+
+### POWER8 Build
+
+```bash
+cd BitNet
+mkdir build-ppc && cd build-ppc
+cmake .. \
+    -DCMAKE_BUILD_TYPE=Release \
+    -DCMAKE_C_FLAGS="-mcpu=power8 -mvsx -maltivec -O3 -mtune=power8 -funroll-loops" \
+    -DCMAKE_CXX_FLAGS="-mcpu=power8 -mvsx -maltivec -O3 -mtune=power8 -funroll-loops -std=c++17"
+make -j$(nproc)
+```
+
+### POWER8 Optimizations
+
+Three levels of optimization are implemented:
+
+1. **Scalar fallback** — Baseline C code for any PowerPC target
+2. **VSX vec_msum kernels** — Uses `vmsummbm` instruction for 16-way signed×unsigned byte multiply-accumulate per cycle. All 5 I2_S kernel functions are vectorized: `quantize_i2_s`, `1x1`, `1x4_32W`, `1xN`, `Nx1`
+3. **L3 resident dcbt prefetch** — Uses `dcbt` with TH=0x10 hint to keep weight tensors pinned in L3 cache between token generation steps, avoiding DRAM re-fetch
+
+### POWER8 Benchmarks
+
+**Hardware**: IBM Power System S824 (8286-42A), Dual 8-core POWER8 (16c/128t SMT8), 512 GB DDR3, Ubuntu 20.04 LTS
+**Run config**: 64 threads, `numactl --interleave=all`, `OMP_PROC_BIND=spread`
+
+#### Scalar → VSX Speedup
+
+| Model | Size | pp128 (scalar) | pp128 (VSX) | Speedup |
+|-------|------|----------------|-------------|---------|
+| BitNet 700M | 257 MiB | 21.48 t/s | 211.48 t/s | **9.8x** |
+| BitNet 2B | 1.71 GiB | 8.04 t/s | 73.03 t/s | **9.1x** |
+| Llama3-8B BitNet | 3.58 GiB | 2.60 t/s | 27.39 t/s | **10.5x** |
+
+#### Full Results (VSX + dcbt resident prefetch)
+
+| Model | Size | Params | pp128 | pp256 | pp512 | tg32 |
+|-------|------|--------|-------|-------|-------|------|
+| BitNet 700M | 257 MiB | 728.84 M | 209.38 t/s | 176.67 t/s | 134.10 t/s | 24.02 t/s |
+| BitNet 2B | 1.71 GiB | 2.74 B | 71.95 t/s | 64.98 t/s | 52.67 t/s | 11.99 t/s |
+| Llama3-8B BitNet | 3.58 GiB | 8.03 B | 26.98 t/s | 25.06 t/s | 21.70 t/s | 5.63 t/s |
+
+#### Total Speedup vs Scalar Baseline
+
+| Model | pp128 | tg32 |
+|-------|-------|------|
+| 700M | **9.7x** | **2.2x** |
+| 2B | **9.0x** | **2.9x** |
+| 8B | **10.4x** | **3.5x** |
+
+### Key Technical Details
+
+- **vec_msum (vmsummbm)**: One POWER8 instruction multiplies 16 signed×unsigned byte pairs and accumulates to 4 int32 lanes — ideal for I2_S ternary {-1, 0, 1} dot products
+- **dcbt resident (TH=0x10)**: Tells POWER8 cache controller to keep data sticky in L3 rather than LRU eviction — gives +5-15% on token generation
+- **Optimal threads**: 64 (not 128) — SMT8 causes cache thrashing at full thread count
+- **NUMA**: `--interleave=all` required for models spanning both memory nodes
+
+### POWER8 Models
+
+Tested with:
+- [microsoft/BitNet-b1.58-2B-4T](https://huggingface.co/microsoft/BitNet-b1.58-2B-4T) (I2_S quantized)
+- [1bitLLM/bitnet_b1_58-large](https://huggingface.co/1bitLLM/bitnet_b1_58-large) (700M)
+- [HF1BitLLM/Llama3-8B-1.58-100B-tokens](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) (converted via `convert-hf-to-gguf-bitnet.py --outtype f32` then `llama-quantize` to I2_S)
+
+Developed by [Elyan Labs](https://github.com/Scottcjn).
