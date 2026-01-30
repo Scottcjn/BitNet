@@ -25,10 +25,17 @@ static inline int hsum_i32_4_vsx(vector signed int v) {
 // POWER8 VSX/AltiVec I2_S kernel helpers
 #include <altivec.h>
 
-// Prefetch weight data to L1 cache
+// L3 resident prefetch - keeps weights STICKY in cache (not evicted by LRU)
+// This is the key enabler for fast token generation
+#define I2S_DCBT_RESIDENT(addr) __asm__ __volatile__("dcbt 16, %0, 0" : : "b"(addr) : "memory")
+// L2 resident for hot data
+#define I2S_DCBT_L2_RESIDENT(addr) __asm__ __volatile__("dcbt 2, %0, 0" : : "b"(addr) : "memory")
+// Transient prefetch for activation data (changes every token)
 #define I2S_DCBT(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr) : "memory")
 // Prefetch to L2 with stream hint
 #define I2S_DCBT_L2(addr) __asm__ __volatile__("dcbt 0,%0,8" : : "r"(addr) : "memory")
+
+#define POWER8_CACHE_LINE 128
 
 static const vector unsigned char vsx_mask03 = {3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3};
 static const vector unsigned char vsx_shift2 = {2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2};
@@ -551,7 +558,7 @@ void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size
     }
 
 #elif defined(__VSX__) || defined(__ALTIVEC__)
-    // POWER8 VSX optimized - 1x1 kernel
+    // POWER8 VSX optimized - 1x1 kernel with L3 resident weight prefetch
     const uint8_t * x = (uint8_t *)vx;
     const int8_t  * y = (int8_t *)vy;
     const int nb = n / QK_I2_S;
@@ -564,11 +571,10 @@ void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size
             const uint8_t * px = x_row + block * 32;
             const int8_t  * py = y + block * 128;
 
-            // Prefetch next block
-            if (block + 1 < nb) {
-                I2S_DCBT(px + 32);
-                I2S_DCBT(py + 128);
-            }
+            // Resident prefetch next weight block (stays in L3 between tokens)
+            if (block + 1 < nb) I2S_DCBT_RESIDENT(px + 32);
+            // Transient prefetch for activations (change every token)
+            if (block + 1 < nb) I2S_DCBT(py + 128);
 
             // Process 32 bytes of weights in 2 x 16-byte halves
             accu = i2s_vsx_half(px, 0,  py, 0,  accu);
@@ -727,8 +733,8 @@ void ggml_vec_dot_i2_i8_s_1x4_32W(int n, float * s, size_t bs, const void * vx, 
                 const uint8_t * px = x_base + (block * 4 + sub) * 32;
                 const int8_t  * py = y + block * 128 + sub * 32;
 
-                // Prefetch next iteration
-                I2S_DCBT(px + 32);
+                // Resident prefetch next weight block
+                I2S_DCBT_RESIDENT(px + 32);
 
                 // Process 32 bytes in 2 halves of 16
                 for (int half = 0; half < 2; half++) {
@@ -1070,7 +1076,7 @@ void ggml_vec_dot_i2_i8_s_1xN(int n, float * s, size_t bs, const void * vx, size
     }
 
 #elif defined(__VSX__) || defined(__ALTIVEC__)
-    // POWER8 VSX optimized - 1xN kernel (PARALLEL_SIZE rows)
+    // POWER8 VSX optimized - 1xN kernel with L3 resident weight prefetch
     const uint8_t * x = (uint8_t *)vx;
     const int8_t  * y = (int8_t *)vy;
     const int nb = n / QK_I2_S;
@@ -1087,14 +1093,14 @@ void ggml_vec_dot_i2_i8_s_1xN(int n, float * s, size_t bs, const void * vx, size
         for (int block = 0; block < nb; block++) {
             const int8_t * py = y + block * 128;
 
-            // Prefetch next block activations
+            // Transient prefetch for activations
             if (block + 1 < nb) I2S_DCBT(py + 128);
 
             for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
                 const uint8_t * px = x_rows[rb] + block * 32;
 
-                // Prefetch next block weights for this row
-                if (block + 1 < nb) I2S_DCBT(px + 32);
+                // Resident prefetch next weight block (stays in L3 between tokens)
+                if (block + 1 < nb) I2S_DCBT_RESIDENT(px + 32);
 
                 // 2 halves of 16 bytes each
                 accu[rb] = i2s_vsx_half(px, 0,  py, 0,  accu[rb]);
@@ -1402,7 +1408,7 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
     }
 
 #elif defined(__VSX__) || defined(__ALTIVEC__)
-    // POWER8 VSX optimized - Nx1 kernel (single x row, PARALLEL_SIZE y columns)
+    // POWER8 VSX optimized - Nx1 kernel with L3 resident weight prefetch
     const uint8_t * x = (uint8_t *)vx;
     const int8_t  * y = (int8_t *)vy;
     const int nb = n / QK_I2_S;
@@ -1416,8 +1422,8 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
         for (int block = 0; block < nb; block++) {
             const uint8_t * px = x + block * 32;
 
-            // Prefetch next block weights
-            if (block + 1 < nb) I2S_DCBT(px + 32);
+            // Resident prefetch next weight block
+            if (block + 1 < nb) I2S_DCBT_RESIDENT(px + 32);
 
             // Process 2 halves of 16 bytes
             for (int half = 0; half < 2; half++) {
