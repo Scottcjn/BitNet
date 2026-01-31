@@ -408,4 +408,55 @@ Tested with:
 - [1bitLLM/bitnet_b1_58-large](https://huggingface.co/1bitLLM/bitnet_b1_58-large) (700M)
 - [HF1BitLLM/Llama3-8B-1.58-100B-tokens](https://huggingface.co/HF1BitLLM/Llama3-8B-1.58-100B-tokens) (converted via `convert-hf-to-gguf-bitnet.py --outtype f32` then `llama-quantize` to I2_S)
 
+### Power Mac G5 (Big-Endian) Support
+
+bitnet.cpp also runs on Power Mac G5 (PowerPC 970, big-endian) with Mac OS X 10.5 Leopard.
+This required solving the GGUF big-endian byte-swap problem: GGUF is always little-endian on disk,
+so all multi-byte scalar values and tensor data must be byte-swapped when reading on big-endian hosts.
+
+#### G5 Big-Endian Patches
+
+The `patches/` directory contains everything needed:
+
+- **`g5-big-endian.patch`** — Adds `gguf_fread_val()` byte-swap function and patches all GGUF scalar reads (header, KV pairs, tensor info). Also adds tensor data byte-swap for F32, F16, and I2_S scale at load time. Fixes `sizeof(bool)==4` on PowerPC GCC.
+- **`regex-ppc.h`** — POSIX regex wrapper replacing `std::regex` which crashes with Bus error on PPC big-endian (GCC libstdc++ bug).
+- **`build_g5.sh`** — Build script that applies patches and compiles with G5-safe flags.
+
+#### G5 Build
+
+```bash
+cd BitNet
+./patches/build_g5.sh /usr/local/gcc-10/bin
+```
+
+Or manually:
+```bash
+cd 3rdparty/llama.cpp
+git apply ../../patches/g5-big-endian.patch
+cp ../../patches/regex-ppc.h common/
+make -j2 CC=/usr/local/gcc-10/bin/gcc CXX=/usr/local/gcc-10/bin/g++ \
+    GGML_NO_METAL=1 LLAMA_NO_ACCELERATE=1 LLAMA_NO_LLAMAFILE=1 "GGML_NO_OPENMP=" \
+    MK_CFLAGS="-mcpu=970 -maltivec -Os -fno-strict-aliasing -I ggml/include" \
+    MK_CXXFLAGS="-mcpu=970 -maltivec -Os -fno-strict-aliasing -std=gnu++17 -I ggml/include -include common/regex-ppc.h" \
+    MK_LDFLAGS="-L/usr/local/gcc-10/lib -lgomp" \
+    llama-cli
+```
+
+#### G5 Benchmarks
+
+**Hardware**: Power Mac G5 Dual 2.0 GHz (PowerPC 970), 8 GB DDR2, Mac OS X 10.5.8 Leopard
+**Compiler**: GCC 10.5.0, `-Os -mcpu=970 -maltivec`
+
+| Model | Size | pp5 | tg30 | Notes |
+|-------|------|-----|------|-------|
+| BitNet 700M | 257 MiB | 4.31 t/s | 1.61 t/s | Scalar I2_S, 2 threads |
+
+#### G5 Key Details
+
+- **Optimization level**: `-Os` is the highest safe level. `-O2` and `-O3` cause Bus errors from instruction scheduling on PowerPC 970.
+- **GGUF byte-swap**: All GGUF numeric fields read through `gguf_fread_val()` which byte-swaps on `__BIG_ENDIAN__`. String data and raw tensor bytes use `gguf_fread_el()` (no swap).
+- **I2_S tensor layout**: Quantized uint8 bytes are endian-independent. Only the trailing float scale (at offset `ne0*ne1/4`) needs byte-swap.
+- **`sizeof(bool)`**: PowerPC GCC defines `sizeof(bool)==4` but GGUF stores bools as 1 byte. Fixed with compile-time conditional.
+- **`--no-mmap` required**: Mac OS X 10.5 mmap behavior differs; use `--no-mmap` flag.
+
 Developed by [Elyan Labs](https://github.com/Scottcjn).
