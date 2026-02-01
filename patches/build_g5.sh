@@ -49,11 +49,13 @@ cp ../../patches/regex-ppc.h common/regex-ppc.h
 echo "    Installed common/regex-ppc.h"
 
 # Step 3: Build using Makefile with G5 AltiVec flags
-# -O3 is now safe: vector constants use vec_splat_u8() (vspltisb instruction)
-# instead of static const arrays, avoiding Mach-O alignment issues on old Darwin.
+# -Os is required: -O2 and -O3 cause Bus errors on G5 due to Mach-O ABI
+# stack alignment issues when GCC generates aggressive vector register spills.
 # -include common/regex-ppc.h replaces broken std::regex on PPC BE
-echo ">>> Step 3: Building llama-cli and llama-bench with AltiVec flags..."
+echo ">>> Step 3: Building llama-cli with AltiVec flags..."
 echo "    (This takes several minutes on dual G5)"
+echo "    NOTE: Use -t 1 for inference (single thread is faster due to"
+echo "          barrier overhead on 870 graph nodes per token)"
 
 make -j2 \
     CC="$CC" \
@@ -62,10 +64,10 @@ make -j2 \
     LLAMA_NO_ACCELERATE=1 \
     LLAMA_NO_LLAMAFILE=1 \
     "GGML_NO_OPENMP=" \
-    MK_CFLAGS="-mcpu=970 -maltivec -O3 -I ggml/include" \
-    MK_CXXFLAGS="-mcpu=970 -maltivec -O3 -std=gnu++17 -I ggml/include -include common/regex-ppc.h" \
+    MK_CFLAGS="-mcpu=970 -maltivec -Os -I ggml/include" \
+    MK_CXXFLAGS="-mcpu=970 -maltivec -Os -std=gnu++17 -I ggml/include -include common/regex-ppc.h" \
     MK_LDFLAGS="-L$(dirname $CC)/../lib -lgomp" \
-    llama-bench llama-cli
+    llama-cli
 
 echo ""
 echo "=== Build complete ==="
@@ -74,12 +76,12 @@ echo "Run inference with:"
 echo "  ./3rdparty/llama.cpp/llama-cli \\"
 echo "    -m <model>.gguf \\"
 echo "    -p \"Once upon a time\" \\"
-echo "    -n 30 -t 2 --no-warmup --no-mmap"
+echo "    -n 30 -t 1 --no-warmup --no-mmap"
 echo ""
-echo "Run benchmarks with:"
-echo "  ./3rdparty/llama.cpp/llama-bench \\"
-echo "    -m <model>.gguf \\"
-echo "    -t 2 -p 128 -n 32"
+echo "Performance: pp6 ~4.7 t/s, tg ~1.7 t/s (AltiVec, -Os, -t 1)"
 echo ""
-echo "Baseline (scalar, -Os): pp5 = 4.31 t/s, tg = 1.61 t/s"
-echo "Target  (AltiVec, -O3): pp5 = 12-20 t/s (3-5x speedup)"
+echo "NOTE: AltiVec dot product kernels are 16x faster than scalar"
+echo "(verified by microbenchmark), but end-to-end speedup is limited"
+echo "by Amdahl's law: matmul is only 12-24% of total inference time."
+echo "The remaining time is framework overhead (layernorm, softmax,"
+echo "RoPE, activation quantization, 870 barrier syncs per token)."

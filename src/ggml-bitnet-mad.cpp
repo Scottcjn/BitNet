@@ -26,14 +26,14 @@
 // Horizontal sum: reduce vector int32 to scalar
 #if defined(BITNET_POWER8_VSX)
 // POWER8 VSX: use vec_sld chain (fast on LE)
-static inline int hsum_i32_4_ppc(vector signed int v) {
+static inline __attribute__((always_inline)) int hsum_i32_4_ppc(vector signed int v) {
     vector signed int sum = vec_add(v, vec_sld(v, v, 8));
     sum = vec_add(sum, vec_sld(sum, sum, 4));
     return vec_extract(sum, 0);
 }
 #else
 // G5 AltiVec (big-endian): use vec_sums
-static inline int hsum_i32_4_ppc(vector signed int v) {
+static inline __attribute__((always_inline)) int hsum_i32_4_ppc(vector signed int v) {
     vector signed int zero = vec_splat_s32(0);
     vector signed int sum = vec_sums(v, zero);
     // vec_sums places result in element 3 on big-endian
@@ -81,7 +81,10 @@ static inline int hsum_i32_4_ppc(vector signed int v) {
 
 // Process one 16-byte half of an I2_S block using vec_msum (vmsummbm)
 // Available on both G5 AltiVec and POWER8 VSX
-static inline vector signed int i2s_ppc_half(
+// always_inline is critical on Mach-O: without it, every call generates
+// VRsave save/restore (mfspr/mtspr ~20 cycles each), devastating for a
+// function called in the inner loop of every dot product.
+static inline __attribute__((always_inline)) vector signed int i2s_ppc_half(
     const uint8_t * __restrict__ px, int px_off,
     const int8_t  * __restrict__ py, int py_off,
     vector signed int accu)
