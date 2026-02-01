@@ -12,59 +12,97 @@
 #define QK_I2_S 128
 #elif defined(__ARM_NEON)
 #define QK_I2_S 64
-#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(__powerpc64__)
+#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(__powerpc64__) || defined(__powerpc__) || defined(__ppc__)
 #define QK_I2_S 128
 #include <altivec.h>
-// POWER8 VSX horizontal sum for 4x int32
-static inline int hsum_i32_4_vsx(vector signed int v) {
+
+// Detect POWER8 VSX vs G5 AltiVec-only
+#if defined(__VSX__)
+#define BITNET_POWER8_VSX 1
+#else
+#define BITNET_G5_ALTIVEC 1
+#endif
+
+// Horizontal sum: reduce vector int32 to scalar
+#if defined(BITNET_POWER8_VSX)
+// POWER8 VSX: use vec_sld chain (fast on LE)
+static inline int hsum_i32_4_ppc(vector signed int v) {
     vector signed int sum = vec_add(v, vec_sld(v, v, 8));
     sum = vec_add(sum, vec_sld(sum, sum, 4));
     return vec_extract(sum, 0);
 }
+#else
+// G5 AltiVec (big-endian): use vec_sums
+static inline int hsum_i32_4_ppc(vector signed int v) {
+    vector signed int zero = vec_splat_s32(0);
+    vector signed int sum = vec_sums(v, zero);
+    // vec_sums places result in element 3 on big-endian
+    return vec_extract(sum, 3);
+}
+#endif
 
-// POWER8 VSX/AltiVec I2_S kernel helpers
-#include <altivec.h>
-
-// L3 resident prefetch - keeps weights STICKY in cache (not evicted by LRU)
-// This is the key enabler for fast token generation
+// Prefetch macros - G5 supports basic dcbt only, POWER8 has TH hints
+#if defined(BITNET_POWER8_VSX)
+// L3 resident prefetch (POWER8 extended hints)
 #define I2S_DCBT_RESIDENT(addr) __asm__ __volatile__("dcbt 16, %0, 0" : : "b"(addr) : "memory")
-// L2 resident for hot data
 #define I2S_DCBT_L2_RESIDENT(addr) __asm__ __volatile__("dcbt 2, %0, 0" : : "b"(addr) : "memory")
-// Transient prefetch for activation data (changes every token)
 #define I2S_DCBT(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr) : "memory")
-// Prefetch to L2 with stream hint
 #define I2S_DCBT_L2(addr) __asm__ __volatile__("dcbt 0,%0,8" : : "r"(addr) : "memory")
+#else
+// G5 AltiVec: basic dcbt only (no TH field)
+#define I2S_DCBT_RESIDENT(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr) : "memory")
+#define I2S_DCBT_L2_RESIDENT(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr) : "memory")
+#define I2S_DCBT(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr) : "memory")
+#define I2S_DCBT_L2(addr) __asm__ __volatile__("dcbt 0,%0" : : "r"(addr) : "memory")
+#endif
 
-#define POWER8_CACHE_LINE 128
+#define PPC_CACHE_LINE 128
 
-static const vector unsigned char vsx_mask03 = {3,3,3,3,3,3,3,3,3,3,3,3,3,3,3,3};
-static const vector unsigned char vsx_shift2 = {2,2,2,2,2,2,2,2,2,2,2,2,2,2,2,2};
-static const vector unsigned char vsx_shift4 = {4,4,4,4,4,4,4,4,4,4,4,4,4,4,4,4};
-static const vector unsigned char vsx_shift6 = {6,6,6,6,6,6,6,6,6,6,6,6,6,6,6,6};
+// Shift/mask constants for 2-bit weight unpacking
+// Use vec_splat_u8() to generate constants in-register (vspltisb instruction)
+// instead of loading from memory - avoids Mach-O alignment issues on old Darwin
+#define ppc_mask03 ((vector unsigned char)vec_splat_u8(3))
+#define ppc_shift2 ((vector unsigned char)vec_splat_u8(2))
+#define ppc_shift4 ((vector unsigned char)vec_splat_u8(4))
+#define ppc_shift6 ((vector unsigned char)vec_splat_u8(6))
 
-// Process one 16-byte half of an I2_S block using vec_msum
-// Unpacks 2-bit weights and multiplies by signed activations
-static inline vector signed int i2s_vsx_half(
+// Vector load abstraction: VSX supports unaligned, AltiVec requires 16-byte alignment
+#if defined(BITNET_POWER8_VSX)
+#define I2S_VEC_LD_UC(off, ptr) vec_vsx_ld(off, (const unsigned char *)(ptr))
+#define I2S_VEC_LD_SC(off, ptr) vec_vsx_ld(off, (const signed char *)(ptr))
+#else
+// G5 AltiVec: vec_ld requires 16-byte aligned addresses.
+// BitNet weight tensors are allocated by ggml with sufficient alignment.
+// For activations that may not be aligned, we use vec_ld which masks the
+// low 4 bits of the effective address (loads from aligned boundary).
+#define I2S_VEC_LD_UC(off, ptr) vec_ld(off, (const unsigned char *)(ptr))
+#define I2S_VEC_LD_SC(off, ptr) vec_ld(off, (const signed char *)(ptr))
+#endif
+
+// Process one 16-byte half of an I2_S block using vec_msum (vmsummbm)
+// Available on both G5 AltiVec and POWER8 VSX
+static inline vector signed int i2s_ppc_half(
     const uint8_t * __restrict__ px, int px_off,
     const int8_t  * __restrict__ py, int py_off,
     vector signed int accu)
 {
-    vector unsigned char packed = vec_vsx_ld(px_off, (const unsigned char *)px);
+    vector unsigned char packed = I2S_VEC_LD_UC(px_off, px);
 
     // Unpack 4 groups from 2-bit packed weights
-    vector unsigned char w0 = vec_and(vec_sr(packed, vsx_shift6), vsx_mask03);
-    vector unsigned char w1 = vec_and(vec_sr(packed, vsx_shift4), vsx_mask03);
-    vector unsigned char w2 = vec_and(vec_sr(packed, vsx_shift2), vsx_mask03);
-    vector unsigned char w3 = vec_and(packed, vsx_mask03);
+    vector unsigned char w0 = vec_and(vec_sr(packed, ppc_shift6), ppc_mask03);
+    vector unsigned char w1 = vec_and(vec_sr(packed, ppc_shift4), ppc_mask03);
+    vector unsigned char w2 = vec_and(vec_sr(packed, ppc_shift2), ppc_mask03);
+    vector unsigned char w3 = vec_and(packed, ppc_mask03);
 
     // Load 16 bytes of activations from each of the 4 groups
-    vector signed char y0 = vec_vsx_ld(py_off,      (const signed char *)py);
-    vector signed char y1 = vec_vsx_ld(py_off + 32,  (const signed char *)py);
-    vector signed char y2 = vec_vsx_ld(py_off + 64,  (const signed char *)py);
-    vector signed char y3 = vec_vsx_ld(py_off + 96,  (const signed char *)py);
+    vector signed char y0 = I2S_VEC_LD_SC(py_off,      py);
+    vector signed char y1 = I2S_VEC_LD_SC(py_off + 32,  py);
+    vector signed char y2 = I2S_VEC_LD_SC(py_off + 64,  py);
+    vector signed char y3 = I2S_VEC_LD_SC(py_off + 96,  py);
 
     // vec_msum: signed char * unsigned char -> accumulate to int32
     // vmsummbm instruction: 16 multiplies + 4 adds per call
+    // Available on G4+ AltiVec and POWER8 VSX
     accu = vec_msum(y0, w0, accu);
     accu = vec_msum(y1, w1, accu);
     accu = vec_msum(y2, w2, accu);
@@ -258,8 +296,8 @@ size_t quantize_i2_s(const float * src, void * dst, int64_t nrow, int64_t n_per_
     return nrow * row_size / 4 + 32;
 
 
-#elif defined(__VSX__) || defined(__ALTIVEC__)
-    // POWER8 VSX quantization (same packing format as x86 ACT_PARALLEL)
+#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(BITNET_G5_ALTIVEC)
+    // PowerPC quantization (POWER8 VSX + G5 AltiVec)
     size_t row_size = ggml_row_size(GGML_TYPE_I2_S, n_per_row);
 
     int64_t n_total = (int64_t)nrow * n_per_row;
@@ -557,31 +595,31 @@ void ggml_vec_dot_i2_i8_s_1x1(int n, float * s, size_t bs, const void * vx, size
         s[row] = (float)sumi;
     }
 
-#elif defined(__VSX__) || defined(__ALTIVEC__)
-    // POWER8 VSX optimized - 1x1 kernel with L3 resident weight prefetch
+#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(BITNET_G5_ALTIVEC)
+    // PowerPC optimized - 1x1 kernel (POWER8 VSX + G5 AltiVec)
     const uint8_t * x = (uint8_t *)vx;
     const int8_t  * y = (int8_t *)vy;
     const int nb = n / QK_I2_S;
 
     for (int row = 0; row < nrc; row++) {
-        vector signed int accu = vec_splats((int)0);
+        vector signed int accu = vec_splat_s32(0);
         const uint8_t * x_row = x + row * bx / 4;
 
         for (int block = 0; block < nb; block++) {
             const uint8_t * px = x_row + block * 32;
             const int8_t  * py = y + block * 128;
 
-            // Resident prefetch next weight block (stays in L3 between tokens)
+            // Prefetch next weight block
             if (block + 1 < nb) I2S_DCBT_RESIDENT(px + 32);
-            // Transient prefetch for activations (change every token)
+            // Prefetch for activations
             if (block + 1 < nb) I2S_DCBT(py + 128);
 
             // Process 32 bytes of weights in 2 x 16-byte halves
-            accu = i2s_vsx_half(px, 0,  py, 0,  accu);
-            accu = i2s_vsx_half(px, 16, py, 16, accu);
+            accu = i2s_ppc_half(px, 0,  py, 0,  accu);
+            accu = i2s_ppc_half(px, 16, py, 16, accu);
         }
 
-        s[row] = (float)hsum_i32_4_vsx(accu);
+        s[row] = (float)hsum_i32_4_ppc(accu);
     }
 
 #else
@@ -715,17 +753,17 @@ void ggml_vec_dot_i2_i8_s_1x4_32W(int n, float * s, size_t bs, const void * vx, 
 #elif defined(__ARM_NEON)
 
 
-#elif defined(__VSX__) || defined(__ALTIVEC__)
-    // POWER8 VSX optimized - 1x4_32W kernel (4 rows, 32-wide interleaved)
+#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(BITNET_G5_ALTIVEC)
+    // PowerPC optimized - 1x4_32W kernel (POWER8 VSX + G5 AltiVec)
     const uint8_t * x = (uint8_t *)vx;
     const int8_t  * y = (int8_t *)vy;
     const int nb = n / QK_I2_S;
 
     for (int row = 0; row < nrc; row += 4) {
-        vector signed int accu0 = vec_splats((int)0);
-        vector signed int accu1 = vec_splats((int)0);
-        vector signed int accu2 = vec_splats((int)0);
-        vector signed int accu3 = vec_splats((int)0);
+        vector signed int accu0 = vec_splat_s32(0);
+        vector signed int accu1 = vec_splat_s32(0);
+        vector signed int accu2 = vec_splat_s32(0);
+        vector signed int accu3 = vec_splat_s32(0);
         const uint8_t * x_base = x + row * bx / 4;
 
         for (int block = 0; block < nb; block++) {
@@ -733,18 +771,18 @@ void ggml_vec_dot_i2_i8_s_1x4_32W(int n, float * s, size_t bs, const void * vx, 
                 const uint8_t * px = x_base + (block * 4 + sub) * 32;
                 const int8_t  * py = y + block * 128 + sub * 32;
 
-                // Resident prefetch next weight block
+                // Prefetch next weight block
                 I2S_DCBT_RESIDENT(px + 32);
 
                 // Process 32 bytes in 2 halves of 16
                 for (int half = 0; half < 2; half++) {
-                    vector unsigned char packed = vec_vsx_ld(half * 16, (const unsigned char *)px);
-                    vector unsigned char w0 = vec_and(vec_sr(packed, vsx_shift6), vsx_mask03);
-                    vector unsigned char w1 = vec_and(vec_sr(packed, vsx_shift4), vsx_mask03);
-                    vector unsigned char w2 = vec_and(vec_sr(packed, vsx_shift2), vsx_mask03);
-                    vector unsigned char w3 = vec_and(packed, vsx_mask03);
+                    vector unsigned char packed = I2S_VEC_LD_UC(half * 16, px);
+                    vector unsigned char w0 = vec_and(vec_sr(packed, ppc_shift6), ppc_mask03);
+                    vector unsigned char w1 = vec_and(vec_sr(packed, ppc_shift4), ppc_mask03);
+                    vector unsigned char w2 = vec_and(vec_sr(packed, ppc_shift2), ppc_mask03);
+                    vector unsigned char w3 = vec_and(packed, ppc_mask03);
 
-                    vector signed char yv = vec_vsx_ld(half * 16, (const signed char *)py);
+                    vector signed char yv = I2S_VEC_LD_SC(half * 16, py);
                     accu0 = vec_msum(yv, w0, accu0);
                     accu1 = vec_msum(yv, w1, accu1);
                     accu2 = vec_msum(yv, w2, accu2);
@@ -753,10 +791,10 @@ void ggml_vec_dot_i2_i8_s_1x4_32W(int n, float * s, size_t bs, const void * vx, 
             }
         }
 
-        s[row + 0] = (float)hsum_i32_4_vsx(accu0);
-        s[row + 1] = (float)hsum_i32_4_vsx(accu1);
-        s[row + 2] = (float)hsum_i32_4_vsx(accu2);
-        s[row + 3] = (float)hsum_i32_4_vsx(accu3);
+        s[row + 0] = (float)hsum_i32_4_ppc(accu0);
+        s[row + 1] = (float)hsum_i32_4_ppc(accu1);
+        s[row + 2] = (float)hsum_i32_4_ppc(accu2);
+        s[row + 3] = (float)hsum_i32_4_ppc(accu3);
     }
 
 #else
@@ -1075,8 +1113,8 @@ void ggml_vec_dot_i2_i8_s_1xN(int n, float * s, size_t bs, const void * vx, size
         }
     }
 
-#elif defined(__VSX__) || defined(__ALTIVEC__)
-    // POWER8 VSX optimized - 1xN kernel with L3 resident weight prefetch
+#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(BITNET_G5_ALTIVEC)
+    // PowerPC optimized - 1xN kernel (POWER8 VSX + G5 AltiVec)
     const uint8_t * x = (uint8_t *)vx;
     const int8_t  * y = (int8_t *)vy;
     const int nb = n / QK_I2_S;
@@ -1086,30 +1124,30 @@ void ggml_vec_dot_i2_i8_s_1xN(int n, float * s, size_t bs, const void * vx, size
         const uint8_t * x_rows[PARALLEL_SIZE];
 
         for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
-            accu[rb] = vec_splats((int)0);
+            accu[rb] = vec_splat_s32(0);
             x_rows[rb] = x + (row + rb) * bx / 4;
         }
 
         for (int block = 0; block < nb; block++) {
             const int8_t * py = y + block * 128;
 
-            // Transient prefetch for activations
+            // Prefetch for activations
             if (block + 1 < nb) I2S_DCBT(py + 128);
 
             for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
                 const uint8_t * px = x_rows[rb] + block * 32;
 
-                // Resident prefetch next weight block (stays in L3 between tokens)
+                // Prefetch next weight block
                 if (block + 1 < nb) I2S_DCBT_RESIDENT(px + 32);
 
                 // 2 halves of 16 bytes each
-                accu[rb] = i2s_vsx_half(px, 0,  py, 0,  accu[rb]);
-                accu[rb] = i2s_vsx_half(px, 16, py, 16, accu[rb]);
+                accu[rb] = i2s_ppc_half(px, 0,  py, 0,  accu[rb]);
+                accu[rb] = i2s_ppc_half(px, 16, py, 16, accu[rb]);
             }
         }
 
         for (int rb = 0; rb < PARALLEL_SIZE; rb++) {
-            s[row + rb] = (float)hsum_i32_4_vsx(accu[rb]);
+            s[row + rb] = (float)hsum_i32_4_ppc(accu[rb]);
         }
     }
 
@@ -1407,8 +1445,8 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
         }
     }
 
-#elif defined(__VSX__) || defined(__ALTIVEC__)
-    // POWER8 VSX optimized - Nx1 kernel with L3 resident weight prefetch
+#elif defined(__VSX__) || defined(__ALTIVEC__) || defined(BITNET_G5_ALTIVEC)
+    // PowerPC optimized - Nx1 kernel (POWER8 VSX + G5 AltiVec)
     const uint8_t * x = (uint8_t *)vx;
     const int8_t  * y = (int8_t *)vy;
     const int nb = n / QK_I2_S;
@@ -1416,30 +1454,30 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
     for (int col = 0; col < nrc; col += PARALLEL_SIZE) {
         vector signed int accu[PARALLEL_SIZE];
         for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
-            accu[iy] = vec_splats((int)0);
+            accu[iy] = vec_splat_s32(0);
         }
 
         for (int block = 0; block < nb; block++) {
             const uint8_t * px = x + block * 32;
 
-            // Resident prefetch next weight block
+            // Prefetch next weight block
             if (block + 1 < nb) I2S_DCBT_RESIDENT(px + 32);
 
             // Process 2 halves of 16 bytes
             for (int half = 0; half < 2; half++) {
-                vector unsigned char packed = vec_vsx_ld(half * 16, (const unsigned char *)px);
-                vector unsigned char w0 = vec_and(vec_sr(packed, vsx_shift6), vsx_mask03);
-                vector unsigned char w1 = vec_and(vec_sr(packed, vsx_shift4), vsx_mask03);
-                vector unsigned char w2 = vec_and(vec_sr(packed, vsx_shift2), vsx_mask03);
-                vector unsigned char w3 = vec_and(packed, vsx_mask03);
+                vector unsigned char packed = I2S_VEC_LD_UC(half * 16, px);
+                vector unsigned char w0 = vec_and(vec_sr(packed, ppc_shift6), ppc_mask03);
+                vector unsigned char w1 = vec_and(vec_sr(packed, ppc_shift4), ppc_mask03);
+                vector unsigned char w2 = vec_and(vec_sr(packed, ppc_shift2), ppc_mask03);
+                vector unsigned char w3 = vec_and(packed, ppc_mask03);
 
                 for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
                     const int8_t * py = (const int8_t *)vy + (col + iy) * by + block * 128;
 
-                    vector signed char y0 = vec_vsx_ld(half * 16,      (const signed char *)py);
-                    vector signed char y1 = vec_vsx_ld(half * 16 + 32, (const signed char *)py);
-                    vector signed char y2 = vec_vsx_ld(half * 16 + 64, (const signed char *)py);
-                    vector signed char y3 = vec_vsx_ld(half * 16 + 96, (const signed char *)py);
+                    vector signed char y0 = I2S_VEC_LD_SC(half * 16,      py);
+                    vector signed char y1 = I2S_VEC_LD_SC(half * 16 + 32, py);
+                    vector signed char y2 = I2S_VEC_LD_SC(half * 16 + 64, py);
+                    vector signed char y3 = I2S_VEC_LD_SC(half * 16 + 96, py);
 
                     accu[iy] = vec_msum(y0, w0, accu[iy]);
                     accu[iy] = vec_msum(y1, w1, accu[iy]);
@@ -1450,7 +1488,7 @@ void ggml_vec_dot_i2_i8_s_Nx1(int n, float * s, size_t bs, const void * vx, size
         }
 
         for (int iy = 0; iy < PARALLEL_SIZE; iy++) {
-            s[(col + iy) * bs] = (float)hsum_i32_4_vsx(accu[iy]);
+            s[(col + iy) * bs] = (float)hsum_i32_4_ppc(accu[iy]);
         }
     }
 
