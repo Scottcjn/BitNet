@@ -6,9 +6,11 @@
 #   - GCC 10+ with C++17 support
 #   - Model file: bitnet_b1_58-large converted to GGUF I2_S format
 #
-# The AltiVec SIMD kernels use the same code path as POWER8 VSX,
-# abstracted through compatibility macros in ggml-bitnet-mad.cpp.
-# Key operations: vec_msum (vmsummbm), vec_ld, vec_splat_u8.
+# Two levels of AltiVec SIMD:
+#   1. Dot-product kernels (ggml-bitnet-mad.cpp) - vec_msum, vec_ld, vec_splat_u8
+#   2. Framework vectorization (ggml.c GGML_SIMD + ggml-quants.c quantize_row_i8_s)
+#      - vec_ld/vec_st, vec_madd, vec_abs, vec_round, vec_packs
+#      - Applied via g5-altivec-framework.patch
 #
 # Usage:
 #   ./patches/build_g5.sh [GCC_PREFIX]
@@ -39,6 +41,8 @@ cd 3rdparty/llama.cpp
 if git diff --quiet HEAD 2>/dev/null; then
     git apply ../../patches/g5-big-endian.patch
     echo "    Applied g5-big-endian.patch"
+    git apply ../../patches/g5-altivec-framework.patch
+    echo "    Applied g5-altivec-framework.patch"
 else
     echo "    Submodule already has local changes, skipping patch"
 fi
@@ -49,9 +53,12 @@ cp ../../patches/regex-ppc.h common/regex-ppc.h
 echo "    Installed common/regex-ppc.h"
 
 # Step 3: Build using Makefile with G5 AltiVec flags
-# -Os is required: -O2 and -O3 cause Bus errors on G5 due to Mach-O ABI
-# stack alignment issues when GCC generates aggressive vector register spills.
+# C code uses -O3 (safe on PPC with GCC 10). C++ uses -Os because GCC 10.5
+# has miscompile bugs at -O2/-O3 on PPC that cause Bus errors in arg.cpp,
+# llama.cpp, and llama-vocab.cpp (aggressive vector register spills hit
+# Mach-O ABI stack alignment issues).
 # -include common/regex-ppc.h replaces broken std::regex on PPC BE
+# -lm required for roundf() in AltiVec quantize path
 echo ">>> Step 3: Building llama-cli with AltiVec flags..."
 echo "    (This takes several minutes on dual G5)"
 echo "    NOTE: Use -t 1 for inference (single thread is faster due to"
@@ -64,9 +71,9 @@ make -j2 \
     LLAMA_NO_ACCELERATE=1 \
     LLAMA_NO_LLAMAFILE=1 \
     "GGML_NO_OPENMP=" \
-    MK_CFLAGS="-mcpu=970 -maltivec -Os -I ggml/include" \
+    MK_CFLAGS="-mcpu=970 -maltivec -O3 -I ggml/include" \
     MK_CXXFLAGS="-mcpu=970 -maltivec -Os -std=gnu++17 -I ggml/include -include common/regex-ppc.h" \
-    MK_LDFLAGS="-L$(dirname $CC)/../lib -lgomp" \
+    MK_LDFLAGS="-L$(dirname $CC)/../lib -lgomp -lm" \
     llama-cli
 
 echo ""
@@ -78,10 +85,12 @@ echo "    -m <model>.gguf \\"
 echo "    -p \"Once upon a time\" \\"
 echo "    -n 30 -t 1 --no-warmup --no-mmap"
 echo ""
-echo "Performance: pp6 ~4.7 t/s, tg ~1.7 t/s (AltiVec, -Os, -t 1)"
+echo "Performance: pp6 ~5.1 t/s, tg ~1.5 t/s (AltiVec + framework SIMD, -t 1)"
 echo ""
-echo "NOTE: AltiVec dot product kernels are 16x faster than scalar"
-echo "(verified by microbenchmark), but end-to-end speedup is limited"
-echo "by Amdahl's law: matmul is only 12-24% of total inference time."
-echo "The remaining time is framework overhead (layernorm, softmax,"
-echo "RoPE, activation quantization, 870 barrier syncs per token)."
+echo "AltiVec SIMD coverage:"
+echo "  - Dot product kernels (ggml-bitnet-mad.cpp): 16x raw speedup"
+echo "  - Framework ops (ggml_vec_scale/add/mul/dot/mad): ~4x via GGML_SIMD"
+echo "  - Activation quantize (quantize_row_i8_s): ~4x via vec_abs/vec_packs"
+echo ""
+echo "End-to-end speedup is limited by -Os C++ (GCC miscompile workaround)"
+echo "and 870 barrier syncs per token at single-thread."
