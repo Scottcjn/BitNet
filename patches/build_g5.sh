@@ -6,11 +6,14 @@
 #   - GCC 10+ with C++17 support
 #   - Model file: bitnet_b1_58-large converted to GGUF I2_S format
 #
-# Two levels of AltiVec SIMD:
+# Three optimization levels:
 #   1. Dot-product kernels (ggml-bitnet-mad.cpp) - vec_msum, vec_ld, vec_splat_u8
 #   2. Framework vectorization (ggml.c GGML_SIMD + ggml-quants.c quantize_row_i8_s)
 #      - vec_ld/vec_st, vec_madd, vec_abs, vec_round, vec_packs
 #      - Applied via g5-altivec-framework.patch
+#   3. OpenMP multi-threading (-fopenmp) - uses both G5 CPUs for 1.45x speedup
+#      CRITICAL: -fopenmp must be in MK_CFLAGS/MK_CXXFLAGS (not just GGML_NO_OPENMP=)
+#      because make command-line variables override Makefile's += appends
 #
 # Usage:
 #   ./patches/build_g5.sh [GCC_PREFIX]
@@ -59,10 +62,9 @@ echo "    Installed common/regex-ppc.h"
 # Mach-O ABI stack alignment issues).
 # -include common/regex-ppc.h replaces broken std::regex on PPC BE
 # -lm required for roundf() in AltiVec quantize path
-echo ">>> Step 3: Building llama-cli with AltiVec flags..."
+echo ">>> Step 3: Building llama-cli with AltiVec + OpenMP flags..."
 echo "    (This takes several minutes on dual G5)"
-echo "    NOTE: Use -t 1 for inference (single thread is faster due to"
-echo "          barrier overhead on 870 graph nodes per token)"
+echo "    Use -t 2 for dual G5 (1.45x speedup via OpenMP)"
 
 make -j2 \
     CC="$CC" \
@@ -71,8 +73,8 @@ make -j2 \
     LLAMA_NO_ACCELERATE=1 \
     LLAMA_NO_LLAMAFILE=1 \
     "GGML_NO_OPENMP=" \
-    MK_CFLAGS="-mcpu=970 -maltivec -O3 -I ggml/include" \
-    MK_CXXFLAGS="-mcpu=970 -maltivec -Os -std=gnu++17 -I ggml/include -include common/regex-ppc.h" \
+    MK_CFLAGS="-mcpu=970 -maltivec -fopenmp -O3 -I ggml/include" \
+    MK_CXXFLAGS="-mcpu=970 -maltivec -fopenmp -Os -std=gnu++17 -I ggml/include -include common/regex-ppc.h" \
     MK_LDFLAGS="-L$(dirname $CC)/../lib -lgomp -lm" \
     llama-cli
 
@@ -83,14 +85,14 @@ echo "Run inference with:"
 echo "  ./3rdparty/llama.cpp/llama-cli \\"
 echo "    -m <model>.gguf \\"
 echo "    -p \"Once upon a time\" \\"
-echo "    -n 30 -t 1 --no-warmup --no-mmap"
+echo "    -n 30 -t 2 --no-warmup --no-mmap"
 echo ""
-echo "Performance: pp6 ~5.1 t/s, tg ~1.5 t/s (AltiVec + framework SIMD, -t 1)"
+echo "Performance (Dual 2.0 GHz G5, BitNet 700M I2_S):"
+echo "  -t 1: ~721 ms/token (~1.4 t/s)"
+echo "  -t 2: ~498 ms/token (~2.0 t/s)  [1.45x speedup]"
 echo ""
-echo "AltiVec SIMD coverage:"
-echo "  - Dot product kernels (ggml-bitnet-mad.cpp): 16x raw speedup"
+echo "Optimization stack:"
+echo "  - Dot product kernels (ggml-bitnet-mad.cpp): AltiVec vec_msum 16x raw"
 echo "  - Framework ops (ggml_vec_scale/add/mul/dot/mad): ~4x via GGML_SIMD"
 echo "  - Activation quantize (quantize_row_i8_s): ~4x via vec_abs/vec_packs"
-echo ""
-echo "End-to-end speedup is limited by -Os C++ (GCC miscompile workaround)"
-echo "and 870 barrier syncs per token at single-thread."
+echo "  - OpenMP threading: 1.45x on dual G5 (both CPUs active)"
