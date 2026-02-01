@@ -46,6 +46,8 @@ if git diff --quiet HEAD 2>/dev/null; then
     echo "    Applied g5-big-endian.patch"
     git apply ../../patches/g5-altivec-framework.patch
     echo "    Applied g5-altivec-framework.patch"
+    git apply ../../patches/g5-altivec-scale.patch
+    echo "    Applied g5-altivec-scale.patch"
 else
     echo "    Submodule already has local changes, skipping patch"
 fi
