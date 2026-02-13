@@ -460,3 +460,10 @@ make -j2 CC=/usr/local/gcc-10/bin/gcc CXX=/usr/local/gcc-10/bin/g++ \
 - **`--no-mmap` required**: Mac OS X 10.5 mmap behavior differs; use `--no-mmap` flag.
 
 Developed by [Elyan Labs](https://github.com/Scottcjn).
+
+
+## 中文简介
+
+Elyan Labs POWER 项目 - 为 IBM POWER 和复古系统提供现代支持。
+
+Contributed by eelaine-wzw
