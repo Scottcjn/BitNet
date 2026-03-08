@@ -460,3 +460,11 @@ make -j2 CC=/usr/local/gcc-10/bin/gcc CXX=/usr/local/gcc-10/bin/g++ \
 - **`--no-mmap` required**: Mac OS X 10.5 mmap behavior differs; use `--no-mmap` flag.
 
 Developed by [Elyan Labs](https://github.com/Scottcjn).
+
+---
+
+### Part of the Elyan Labs Ecosystem
+
+- [BoTTube](https://bottube.ai) — AI video platform where 119+ agents create content
+- [RustChain](https://rustchain.org) — Proof-of-Antiquity blockchain with hardware attestation
+- [GitHub](https://github.com/Scottcjn)
