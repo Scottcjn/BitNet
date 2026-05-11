@@ -247,7 +247,7 @@ optional arguments:
 </pre>
 
 ### Benchmark
-We provide scripts to run the inference benchmark providing a model.
+We provide scripts to run inference benchmarks for a given model.
 
 ```  
 usage: e2e_benchmark.py -m MODEL [-n N_TOKEN] [-p N_PROMPT] [-t THREADS]  
