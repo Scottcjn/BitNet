@@ -4,6 +4,6 @@
 # Source bundle + build artifacts
 bitnet-g5-src.tar.gz
 build-pkg/
-llama.cpp.tmp/
+llama.cpp.tmp
 *.orig
 # Large GGUF models (exceed GitHub 100MB limit)
