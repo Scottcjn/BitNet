@@ -1,47 +1,9 @@
-# Extensions
 
-*.a
-*.bat
-*.bin
-*.dll
-*.dot
-*.etag
-*.exe
-*.gcda
-*.gcno
-*.gcov
+# Large GGUF models (exceed GitHub 100MB limit — built via gguf_bswap_patch.py)
 *.gguf
-*.gguf.json
-*.lastModified
-*.log
-*.metallib
-*.o
-*.so
-*.tmp
-
-# IDE / OS
-
-.cache/
-.ccls-cache/
-.direnv/
-.DS_Store
-.envrc
-.idea/
-.swiftpm
-.vs/
-.vscode/
-nppBackup
-
-# Models
-models/*
-gpu/checkpoints/*
-
-# Python
-
-/.venv
-__pycache__/
-*/poetry.lock
-poetry.toml
-
-build/
-logs/
+# Source bundle + build artifacts
+bitnet-g5-src.tar.gz
+build-pkg/
+llama.cpp.tmp/
+*.orig
+# Large GGUF models (exceed GitHub 100MB limit)
